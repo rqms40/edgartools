@@ -453,16 +453,18 @@ def _country_name_en(value: str) -> str:
 
 
 # Exchange names as filers write them on the cover page, to the code the SEC
-# expects in dei:SecurityExchangeName. Matching is on the folded key, after the
-# leading article and the corporate suffix are dropped.
+# expects in dei:SecurityExchangeName. That concept is
+# dei:edgarExchangeCodeItemType: the token must match the enumeration exactly,
+# including case (https://xbrl.sec.gov/dei/2026/dei-2026.xsd). Matching is on
+# the folded key, after the leading article and the corporate suffix are dropped.
 _EXCHANGE_CODES = {
     'new york stock exchange': 'NYSE',
     'nyse': 'NYSE',
     'nyse american': 'NYSEAMER',
     'american stock exchange': 'NYSEAMER',
-    'nyse arca': 'NYSEARCA',
+    'nyse arca': 'NYSEArca',
     'nyse national': 'NYSENAT',
-    'nyse texas': 'NYSETXSE',
+    'nyse texas': 'NYSETX',
     'nasdaq': 'NASDAQ',
     'nasdaq stock market': 'NASDAQ',
     'nasdaq global select market': 'NASDAQ',
@@ -481,7 +483,7 @@ _EXCHANGE_CODES = {
     'long term stock exchange': 'LTSE',
     'members exchange': 'MEMX',
     'memx': 'MEMX',
-    'miax pearl': 'MIAXPEARL',
+    'miax pearl': 'PEARL',
     'miami international securities exchange': 'MIAX',
     'box exchange': 'BOX',
     'nyse chicago': 'NYSECHX',
