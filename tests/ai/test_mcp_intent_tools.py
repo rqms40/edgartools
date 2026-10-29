@@ -294,12 +294,7 @@ class TestEdgarCompanyTool:
         """Legacy annual=False maps to quarterly period."""
         from edgar.ai.mcp.tools.company import edgar_company
 
-        result = await edgar_company(
-            identifier="MSFT",
-            include=["financials"],
-            annual=False,
-            periods=1
-        )
+        result = await edgar_company(identifier="MSFT", include=["financials"], annual=False, periods=1)
         assert result.success is True
         assert result.data["financials"]["period_type"] == "quarterly"
 
@@ -308,11 +303,7 @@ class TestEdgarCompanyTool:
         """Invalid period falls back to annual."""
         from edgar.ai.mcp.tools.company import edgar_company
 
-        result = await edgar_company(
-            identifier="MSFT",
-            include=["financials"],
-            period="invalid_mode"
-        )
+        result = await edgar_company(identifier="MSFT", include=["financials"], period="invalid_mode")
         assert result.success is True
         assert result.data["financials"]["period_type"] == "annual"
 
@@ -432,8 +423,7 @@ class TestExtract13FHoldings:
 
         holdings = pd.DataFrame(
             [
-                dict(Issuer=f"ISSUER {i}", Class="COM", Cusip=f"C{i:08d}", Ticker=f"T{i}",
-                     SharesPrnAmount=1000 + i, Value=float(100000 - i))
+                dict(Issuer=f"ISSUER {i}", Class="COM", Cusip=f"C{i:08d}", Ticker=f"T{i}", SharesPrnAmount=1000 + i, Value=float(100000 - i))
                 for i in range(211)
             ]
         )
@@ -522,16 +512,34 @@ class TestEdgarOwnershipTool:
 
     @pytest.mark.asyncio
     async def test_insider_transactions(self):
-        """Get insider transactions for a company."""
+        """Insider entries name the person, their role and their trades, inside `days`."""
+        from datetime import date, timedelta
+
         from edgar.ai.mcp.tools.ownership import edgar_ownership
 
         result = await edgar_ownership(
             identifier="AAPL",
             analysis_type="insiders",
+            days=90,
             limit=5,
         )
         assert result.success is True
         assert result.data["analysis"] == "insider_transactions"
+        rows = result.data["transactions"]
+        assert result.data["transaction_count"] == len(rows)
+        assert rows, "AAPL should have Form 4 filings in a 90-day window"
+        cutoff = (date.today() - timedelta(days=90)).isoformat()
+        for row in rows:
+            assert row["filing_date"] >= cutoff
+            assert row["insider_name"]
+            assert row["role"]
+            assert isinstance(row["is_officer"], bool)
+            assert isinstance(row["is_director"], bool)
+        assert any(row.get("transactions") for row in rows)
+        for row in rows:
+            for trade in row.get("transactions") or []:
+                assert isinstance(trade["shares"], int)
+                assert trade["shares"] > 0
 
     @pytest.mark.asyncio
     async def test_institutional_holders_removed(self):

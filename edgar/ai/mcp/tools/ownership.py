@@ -7,24 +7,25 @@ Get ownership data: insider transactions, institutional holders, or fund portfol
 from __future__ import annotations
 
 import logging
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from edgar.ai.mcp.tools.base import (
-    tool,
-    success,
-    error,
-    resolve_company,
-    get_error_suggestions,
     _cell_number,
     _cell_text,
     _holding_rows,
+    error,
+    get_error_suggestions,
+    resolve_company,
+    success,
+    tool,
 )
 
 logger = logging.getLogger(__name__)
 
 # Upper bound on `limit`, matching edgar_monitor and edgar_screen. The insider
-# path parses up to 2 * limit Form 4 filings, so an unbounded limit would let
-# one call fetch every Form 4 a company has ever filed.
+# path parses one Form 4 per result, so an unbounded limit would let one call
+# fetch every Form 4 inside the lookback.
 _MAX_LIMIT = 100
 
 
@@ -39,34 +40,19 @@ Examples:
     params={
         "identifier": {
             "type": "string",
-            "description": "Company ticker/CIK (for insiders) OR fund/institution CIK (for fund_portfolio/portfolio_diff)"
+            "description": "Company ticker/CIK (for insiders) OR fund/institution CIK (for fund_portfolio/portfolio_diff)",
         },
         "analysis_type": {
             "type": "string",
             "enum": ["insiders", "fund_portfolio", "portfolio_diff"],
-            "description": "insiders=Form 4 insider trades, fund_portfolio=13F holdings, portfolio_diff=quarter-over-quarter changes"
+            "description": "insiders=Form 4 insider trades, fund_portfolio=13F holdings, portfolio_diff=quarter-over-quarter changes",
         },
-        "days": {
-            "type": "integer",
-            "description": "Lookback period for insider transactions (default 90)",
-            "default": 90
-        },
-        "limit": {
-            "type": "integer",
-            "description": "Max results (default 20, max 100)",
-            "default": 20,
-            "minimum": 1,
-            "maximum": _MAX_LIMIT
-        }
+        "days": {"type": "integer", "description": "Lookback period for insider transactions (default 90)", "default": 90},
+        "limit": {"type": "integer", "description": "Max results (default 20, max 100)", "default": 20, "minimum": 1, "maximum": _MAX_LIMIT},
     },
-    required=["identifier", "analysis_type"]
+    required=["identifier", "analysis_type"],
 )
-async def edgar_ownership(
-    identifier: str,
-    analysis_type: str,
-    days: int = 90,
-    limit: int = 20
-) -> Any:
+async def edgar_ownership(identifier: str, analysis_type: str, days: int = 90, limit: int = 20) -> Any:
     """
     Get ownership information.
 
@@ -89,84 +75,156 @@ async def edgar_ownership(
                     "Use analysis_type='fund_portfolio' with a fund's CIK to see what it holds",
                     "Use edgar_search with form='13F-HR' to find institutional filings",
                     "Use analysis_type='insiders' to see insider trading activity",
-                ]
+                ],
             )
         else:
-            return error(
-                f"Unknown analysis_type: {analysis_type}",
-                suggestions=["Use 'insiders', 'fund_portfolio', or 'portfolio_diff'"]
-            )
+            return error(f"Unknown analysis_type: {analysis_type}", suggestions=["Use 'insiders', 'fund_portfolio', or 'portfolio_diff'"])
 
     except Exception as e:
         logger.exception("Error in edgar_ownership")
         return error(str(e), suggestions=get_error_suggestions(e))
 
 
+# How many non-derivative rows to keep from one Form 4. Colette Kress's
+# NVIDIA filing 0001588670-26-000014 has four; the cap stays above that.
+_PER_FILING_TRADE_CAP = 5
+
+
+def _as_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    # datetime is a date, so it has to be handled before the date branch.
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value)[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _oldest_filing_date(filings: Any) -> date | None:
+    """Earliest filing date in an already-loaded filings table, or None."""
+    if filings is None or len(filings) == 0:
+        return None
+    dates = [_as_date(value) for value in filings.data.column("filing_date").to_pylist()]
+    present = [value for value in dates if value is not None]
+    return min(present) if present else None
+
+
+def _today() -> date:
+    """Clock for the insider lookback. Tests patch this rather than ``date.today``."""
+    return date.today()
+
+
+def _form4s_in_lookback(company: Any, days: int) -> Any:
+    """Form 4 filings whose filing date is inside the lookback, newest first.
+
+    The date filter runs before ``limit``. The recent submissions page is
+    enough when it already reaches the cutoff; older pagination files are
+    loaded only when the lookback extends past that page.
+    """
+    cutoff = _today() - timedelta(days=days)
+    window = f"{cutoff.isoformat()}:"
+    recent = company.get_filings(form="4", trigger_full_load=False)
+    oldest = _oldest_filing_date(recent)
+    if recent is not None and oldest is not None and oldest <= cutoff:
+        return recent.filter(filing_date=window)
+    return company.get_filings(form="4", filing_date=window, trigger_full_load=True)
+
+
+def _owner_fields(form4: Any) -> dict[str, Any]:
+    """Name, role and relationship flags from the Form 4 reporting owner."""
+    owners = form4.reporting_owners.owners if form4.reporting_owners else []
+    if not owners:
+        return {}
+    owner = owners[0]
+    title = owner.officer_title or owner.position
+    return {
+        "insider_name": form4.insider_name,
+        "role": form4.position,
+        "title": title,
+        "is_officer": bool(owner.is_officer),
+        "is_director": bool(owner.is_director),
+        "is_ten_pct_owner": bool(owner.is_ten_pct_owner),
+        "is_other": bool(owner.is_other),
+    }
+
+
+def _non_derivative_trades(form4: Any) -> list[dict[str, Any]]:
+    """Non-derivative rows from ``Form4.non_derivative_table``."""
+    table = form4.non_derivative_table
+    if table is None or not table.has_transactions:
+        return []
+    trades = []
+    rows = table.transactions
+    for index in range(min(_PER_FILING_TRADE_CAP, len(rows))):
+        trade = rows[index]
+        detail: dict[str, Any] = {
+            "type": trade.transaction_type,
+            "code": trade.transaction_code,
+            "action": trade.acquired_disposed,
+        }
+        shares = _cell_number(trade.shares, as_int=True)
+        if shares is not None:
+            detail["shares"] = shares
+        price = _cell_number(trade.price)
+        if price is not None:
+            detail["price"] = price
+        security = trade.security
+        if security:
+            detail["security"] = str(security)
+        if trade.date is not None:
+            detail["date"] = str(trade.date)[:10]
+        trades.append(detail)
+    return trades
+
 
 async def _get_insider_transactions(identifier: str, days: int, limit: int) -> Any:
     """Get insider trading activity from Form 4 filings."""
     try:
-        company = resolve_company(identifier)
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            return error(
+                f"days must be an integer, got {days!r}",
+                suggestions=["Pass days as a whole number of calendar days, for example 90"],
+            )
+        if days < 0:
+            return error(
+                f"days must be zero or positive, got {days}",
+                suggestions=["Use days=0 for filings from today only"],
+            )
 
-        # Get Form 4 filings
-        form4_filings = company.get_filings(form="4").head(limit * 2)  # Get extra in case some fail
+        company = resolve_company(identifier)
+        form4_filings = _form4s_in_lookback(company, days)
 
         transactions = []
-        for filing in form4_filings:
+        for filing in form4_filings or []:
             try:
                 txn = {
                     "filing_date": str(filing.filing_date),
                     "accession_number": filing.accession_number,
                 }
 
-                # Try to extract details from the Form 4 object
                 try:
-                    obj = filing.obj()
-
-                    # Get reporting owner info
-                    if hasattr(obj, 'reporting_owner'):
-                        owner = obj.reporting_owner
-                        if hasattr(owner, 'name'):
-                            txn["insider_name"] = owner.name
-                        else:
-                            txn["insider_name"] = str(owner)
-
-                    # Get relationship
-                    if hasattr(obj, 'is_officer'):
-                        txn["is_officer"] = obj.is_officer
-                    if hasattr(obj, 'is_director'):
-                        txn["is_director"] = obj.is_director
-                    if hasattr(obj, 'officer_title'):
-                        txn["title"] = obj.officer_title
-
-                    # Get transactions
-                    if hasattr(obj, 'transactions'):
-                        txn_list = []
-                        for t in obj.transactions[:5]:  # Limit transactions per filing
-                            txn_detail = {}
-                            if hasattr(t, 'transaction_type'):
-                                txn_detail["type"] = t.transaction_type
-                            if hasattr(t, 'shares'):
-                                txn_detail["shares"] = t.shares
-                            if hasattr(t, 'price'):
-                                txn_detail["price"] = float(t.price) if t.price else None
-                            if hasattr(t, 'acquired_disposed'):
-                                txn_detail["action"] = t.acquired_disposed
-                            if txn_detail:
-                                txn_list.append(txn_detail)
-                        if txn_list:
-                            txn["transactions"] = txn_list
-
-                except Exception as e:
-                    logger.debug(f"Could not parse Form 4 details: {e}")
+                    form4 = filing.obj()
+                    txn.update(_owner_fields(form4))
+                    trades = _non_derivative_trades(form4)
+                    if trades:
+                        txn["transactions"] = trades
+                except Exception as exc:
+                    logger.debug("Could not parse Form 4 details: %s", exc)
 
                 transactions.append(txn)
 
                 if len(transactions) >= limit:
                     break
 
-            except Exception as e:
-                logger.debug(f"Could not process Form 4 filing: {e}")
+            except Exception as exc:
+                logger.debug("Could not process Form 4 filing: %s", exc)
                 continue
 
         result = {
@@ -177,10 +235,7 @@ async def _get_insider_transactions(identifier: str, days: int, limit: int) -> A
             "transactions": transactions,
         }
 
-        next_steps = [
-            "Use analysis_type='fund_portfolio' with a fund's CIK to see its holdings",
-            "Use edgar_company for full company analysis"
-        ]
+        next_steps = ["Use analysis_type='fund_portfolio' with a fund's CIK to see its holdings", "Use edgar_company for full company analysis"]
 
         return success(result, next_steps=next_steps)
 
@@ -202,8 +257,8 @@ async def _get_fund_holdings(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "13F filers (hedge funds, institutions) often need CIK, not ticker",
                     "Example: Berkshire Hathaway CIK is 1067983",
-                    "Use edgar_search to find the fund's CIK"
-                ]
+                    "Use edgar_search to find the fund's CIK",
+                ],
             )
 
         # Get 13F filings
@@ -215,8 +270,8 @@ async def _get_fund_holdings(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "This may not be an institutional investor required to file 13F",
                     "13F is required for institutions managing >$100M in securities",
-                    "Try a known fund CIK like 1067983 (Berkshire)"
-                ]
+                    "Try a known fund CIK like 1067983 (Berkshire)",
+                ],
             )
 
         # Get the most recent 13F
@@ -234,7 +289,7 @@ async def _get_fund_holdings(identifier: str, limit: int) -> Any:
         try:
             obj = latest_13f.obj()
 
-            holdings_table = getattr(obj, 'holdings', None)
+            holdings_table = getattr(obj, "holdings", None)
 
             if holdings_table is not None:
                 holdings = _holding_rows(holdings_table, limit)
@@ -273,8 +328,8 @@ async def _get_portfolio_diff(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "13F filers (hedge funds, institutions) often need CIK, not ticker",
                     "Example: Berkshire Hathaway CIK is 1067983",
-                    "Use edgar_search to find the fund's CIK"
-                ]
+                    "Use edgar_search to find the fund's CIK",
+                ],
             )
 
         # Get latest 13F filing
@@ -286,7 +341,7 @@ async def _get_portfolio_diff(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "This may not be an institutional investor required to file 13F",
                     "13F is required for institutions managing >$100M in securities",
-                ]
+                ],
             )
 
         latest_13f = filings_13f[0]
@@ -299,7 +354,7 @@ async def _get_portfolio_diff(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "Use analysis_type='fund_portfolio' to see current holdings",
                     "The fund may only have one 13F filing",
-                ]
+                ],
             )
 
         # Serialize the comparison DataFrame
