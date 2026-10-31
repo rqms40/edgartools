@@ -294,7 +294,12 @@ class TestEdgarCompanyTool:
         """Legacy annual=False maps to quarterly period."""
         from edgar.ai.mcp.tools.company import edgar_company
 
-        result = await edgar_company(identifier="MSFT", include=["financials"], annual=False, periods=1)
+        result = await edgar_company(
+            identifier="MSFT",
+            include=["financials"],
+            annual=False,
+            periods=1
+        )
         assert result.success is True
         assert result.data["financials"]["period_type"] == "quarterly"
 
@@ -303,7 +308,11 @@ class TestEdgarCompanyTool:
         """Invalid period falls back to annual."""
         from edgar.ai.mcp.tools.company import edgar_company
 
-        result = await edgar_company(identifier="MSFT", include=["financials"], period="invalid_mode")
+        result = await edgar_company(
+            identifier="MSFT",
+            include=["financials"],
+            period="invalid_mode"
+        )
         assert result.success is True
         assert result.data["financials"]["period_type"] == "annual"
 
@@ -423,7 +432,8 @@ class TestExtract13FHoldings:
 
         holdings = pd.DataFrame(
             [
-                dict(Issuer=f"ISSUER {i}", Class="COM", Cusip=f"C{i:08d}", Ticker=f"T{i}", SharesPrnAmount=1000 + i, Value=float(100000 - i))
+                dict(Issuer=f"ISSUER {i}", Class="COM", Cusip=f"C{i:08d}", Ticker=f"T{i}",
+                     SharesPrnAmount=1000 + i, Value=float(100000 - i))
                 for i in range(211)
             ]
         )
@@ -538,8 +548,10 @@ class TestEdgarOwnershipTool:
         assert any(row.get("transactions") for row in rows)
         for row in rows:
             for trade in row.get("transactions") or []:
-                assert isinstance(trade["shares"], int)
-                assert trade["shares"] > 0
+                shares = trade["shares"]
+                # Fractional quantities stay fractional (Vertex reports 196.356).
+                assert isinstance(shares, (int, float)) and not isinstance(shares, bool)
+                assert shares > 0
 
     @pytest.mark.asyncio
     async def test_institutional_holders_removed(self):

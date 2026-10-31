@@ -20,6 +20,7 @@ from edgar.ai.mcp.tools.base import (
     success,
     tool,
 )
+from edgar.ownership.core import translate_transaction_types
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +41,34 @@ Examples:
     params={
         "identifier": {
             "type": "string",
-            "description": "Company ticker/CIK (for insiders) OR fund/institution CIK (for fund_portfolio/portfolio_diff)",
+            "description": "Company ticker/CIK (for insiders) OR fund/institution CIK (for fund_portfolio/portfolio_diff)"
         },
         "analysis_type": {
             "type": "string",
             "enum": ["insiders", "fund_portfolio", "portfolio_diff"],
-            "description": "insiders=Form 4 insider trades, fund_portfolio=13F holdings, portfolio_diff=quarter-over-quarter changes",
+            "description": "insiders=Form 4 insider trades, fund_portfolio=13F holdings, portfolio_diff=quarter-over-quarter changes"
         },
-        "days": {"type": "integer", "description": "Lookback period for insider transactions (default 90)", "default": 90},
-        "limit": {"type": "integer", "description": "Max results (default 20, max 100)", "default": 20, "minimum": 1, "maximum": _MAX_LIMIT},
+        "days": {
+            "type": "integer",
+            "description": "Lookback period for insider transactions (default 90)",
+            "default": 90
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Max results (default 20, max 100)",
+            "default": 20,
+            "minimum": 1,
+            "maximum": _MAX_LIMIT
+        }
     },
-    required=["identifier", "analysis_type"],
+    required=["identifier", "analysis_type"]
 )
-async def edgar_ownership(identifier: str, analysis_type: str, days: int = 90, limit: int = 20) -> Any:
+async def edgar_ownership(
+    identifier: str,
+    analysis_type: str,
+    days: int = 90,
+    limit: int = 20
+) -> Any:
     """
     Get ownership information.
 
@@ -75,18 +91,22 @@ async def edgar_ownership(identifier: str, analysis_type: str, days: int = 90, l
                     "Use analysis_type='fund_portfolio' with a fund's CIK to see what it holds",
                     "Use edgar_search with form='13F-HR' to find institutional filings",
                     "Use analysis_type='insiders' to see insider trading activity",
-                ],
+                ]
             )
         else:
-            return error(f"Unknown analysis_type: {analysis_type}", suggestions=["Use 'insiders', 'fund_portfolio', or 'portfolio_diff'"])
+            return error(
+                f"Unknown analysis_type: {analysis_type}",
+                suggestions=["Use 'insiders', 'fund_portfolio', or 'portfolio_diff'"]
+            )
 
     except Exception as e:
         logger.exception("Error in edgar_ownership")
         return error(str(e), suggestions=get_error_suggestions(e))
 
 
-# How many non-derivative rows to keep from one Form 4. Colette Kress's
-# NVIDIA filing 0001588670-26-000014 has four; the cap stays above that.
+# How many transaction rows to keep from one Form 4. Colette Kress's
+# NVIDIA filing 0001588670-26-000014 has four non-derivative rows; the cap
+# stays above that and also covers a derivative-only filing's rows.
 _PER_FILING_TRADE_CAP = 5
 
 
@@ -135,16 +155,12 @@ def _form4s_in_lookback(company: Any, days: int) -> Any:
     return company.get_filings(form="4", filing_date=window, trigger_full_load=True)
 
 
-def _owner_fields(form4: Any) -> dict[str, Any]:
-    """Name, role and relationship flags from the Form 4 reporting owner."""
-    owners = form4.reporting_owners.owners if form4.reporting_owners else []
-    if not owners:
-        return {}
-    owner = owners[0]
+def _one_owner(owner: Any) -> dict[str, Any]:
+    """Name, role and relationship flags for a single reporting owner."""
     title = owner.officer_title or owner.position
     return {
-        "insider_name": form4.insider_name,
-        "role": form4.position,
+        "insider_name": owner.name,
+        "role": owner.position,
         "title": title,
         "is_officer": bool(owner.is_officer),
         "is_director": bool(owner.is_director),
@@ -153,32 +169,75 @@ def _owner_fields(form4: Any) -> dict[str, Any]:
     }
 
 
-def _non_derivative_trades(form4: Any) -> list[dict[str, Any]]:
-    """Non-derivative rows from ``Form4.non_derivative_table``."""
-    table = form4.non_derivative_table
-    if table is None or not table.has_transactions:
+def _owner_fields(form4: Any) -> dict[str, Any]:
+    """Reporting owners, one record each.
+
+    Scalar ``insider_name``, ``role`` and the relationship flags describe the
+    first reporting owner, the same owner as ``owners[0]``. ``Form4.insider_name``
+    joins every owner with ``" / "`` and ``Form4.position`` joins them with
+    ``"/ "``, so copying those strings would attach the first owner's flags to
+    a combined name. Joint filings keep each owner in ``owners``.
+    """
+    owners = form4.reporting_owners.owners if form4.reporting_owners else []
+    if not owners:
+        return {}
+    records = [_one_owner(owner) for owner in owners]
+    fields = dict(records[0])
+    fields["owners"] = records
+    return fields
+
+
+def _trade_row(trade: Any, *, derivative: bool) -> dict[str, Any]:
+    code = trade.transaction_code
+    txn_type = getattr(trade, "transaction_type", None) or translate_transaction_types(code)
+    detail: dict[str, Any] = {
+        "type": txn_type,
+        "code": code,
+        "action": trade.acquired_disposed,
+    }
+    if derivative:
+        detail["derivative"] = True
+    # Share counts are sometimes fractional (Vertex 0001209191-20-055264
+    # reports 196.356 deferred stock units). ``as_int`` would truncate them.
+    shares = _cell_number(trade.shares)
+    if shares is not None:
+        detail["shares"] = shares
+    price = _cell_number(trade.price)
+    if price is not None:
+        detail["price"] = price
+    security = trade.security
+    if security:
+        detail["security"] = str(security)
+    underlying = getattr(trade, "underlying", None)
+    if underlying:
+        detail["underlying"] = str(underlying)
+    if trade.date is not None:
+        detail["date"] = str(trade.date)[:10]
+    return detail
+
+
+def _table_trades(table: Any, *, derivative: bool, remaining: int) -> list[dict[str, Any]]:
+    if table is None or remaining <= 0 or not table.has_transactions:
         return []
-    trades = []
     rows = table.transactions
-    for index in range(min(_PER_FILING_TRADE_CAP, len(rows))):
-        trade = rows[index]
-        detail: dict[str, Any] = {
-            "type": trade.transaction_type,
-            "code": trade.transaction_code,
-            "action": trade.acquired_disposed,
-        }
-        shares = _cell_number(trade.shares, as_int=True)
-        if shares is not None:
-            detail["shares"] = shares
-        price = _cell_number(trade.price)
-        if price is not None:
-            detail["price"] = price
-        security = trade.security
-        if security:
-            detail["security"] = str(security)
-        if trade.date is not None:
-            detail["date"] = str(trade.date)[:10]
-        trades.append(detail)
+    count = min(remaining, len(rows))
+    return [_trade_row(rows[index], derivative=derivative) for index in range(count)]
+
+
+def _reported_trades(form4: Any) -> list[dict[str, Any]]:
+    """Non-derivative rows, then derivative rows, up to the per-filing cap.
+
+    A derivative-only Form 4 has an empty non-derivative table. Reading only
+    that table drops the filing's entire activity.
+    """
+    trades = _table_trades(form4.non_derivative_table, derivative=False, remaining=_PER_FILING_TRADE_CAP)
+    trades.extend(
+        _table_trades(
+            getattr(form4, "derivative_table", None),
+            derivative=True,
+            remaining=_PER_FILING_TRADE_CAP - len(trades),
+        )
+    )
     return trades
 
 
@@ -212,7 +271,7 @@ async def _get_insider_transactions(identifier: str, days: int, limit: int) -> A
                 try:
                     form4 = filing.obj()
                     txn.update(_owner_fields(form4))
-                    trades = _non_derivative_trades(form4)
+                    trades = _reported_trades(form4)
                     if trades:
                         txn["transactions"] = trades
                 except Exception as exc:
@@ -235,7 +294,10 @@ async def _get_insider_transactions(identifier: str, days: int, limit: int) -> A
             "transactions": transactions,
         }
 
-        next_steps = ["Use analysis_type='fund_portfolio' with a fund's CIK to see its holdings", "Use edgar_company for full company analysis"]
+        next_steps = [
+            "Use analysis_type='fund_portfolio' with a fund's CIK to see its holdings",
+            "Use edgar_company for full company analysis"
+        ]
 
         return success(result, next_steps=next_steps)
 
@@ -257,8 +319,8 @@ async def _get_fund_holdings(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "13F filers (hedge funds, institutions) often need CIK, not ticker",
                     "Example: Berkshire Hathaway CIK is 1067983",
-                    "Use edgar_search to find the fund's CIK",
-                ],
+                    "Use edgar_search to find the fund's CIK"
+                ]
             )
 
         # Get 13F filings
@@ -270,8 +332,8 @@ async def _get_fund_holdings(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "This may not be an institutional investor required to file 13F",
                     "13F is required for institutions managing >$100M in securities",
-                    "Try a known fund CIK like 1067983 (Berkshire)",
-                ],
+                    "Try a known fund CIK like 1067983 (Berkshire)"
+                ]
             )
 
         # Get the most recent 13F
@@ -289,7 +351,7 @@ async def _get_fund_holdings(identifier: str, limit: int) -> Any:
         try:
             obj = latest_13f.obj()
 
-            holdings_table = getattr(obj, "holdings", None)
+            holdings_table = getattr(obj, 'holdings', None)
 
             if holdings_table is not None:
                 holdings = _holding_rows(holdings_table, limit)
@@ -328,8 +390,8 @@ async def _get_portfolio_diff(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "13F filers (hedge funds, institutions) often need CIK, not ticker",
                     "Example: Berkshire Hathaway CIK is 1067983",
-                    "Use edgar_search to find the fund's CIK",
-                ],
+                    "Use edgar_search to find the fund's CIK"
+                ]
             )
 
         # Get latest 13F filing
@@ -341,7 +403,7 @@ async def _get_portfolio_diff(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "This may not be an institutional investor required to file 13F",
                     "13F is required for institutions managing >$100M in securities",
-                ],
+                ]
             )
 
         latest_13f = filings_13f[0]
@@ -354,7 +416,7 @@ async def _get_portfolio_diff(identifier: str, limit: int) -> Any:
                 suggestions=[
                     "Use analysis_type='fund_portfolio' to see current holdings",
                     "The fund may only have one 13F filing",
-                ],
+                ]
             )
 
         # Serialize the comparison DataFrame
